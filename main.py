@@ -34,7 +34,7 @@ def generate_chart(subset_df, filename, title_text):
 
 # Define timeframes
 periods = {
-    "chart_1month.png": (df.last("30D"), "1-Week Historical Stock Price Movements"),
+    "chart_1week.png": (df.last("7D"), "1-Week Historical Stock Price Movements"),
     "chart_1month.png": (df.last("30D"), "1-Month Historical Stock Price Movements"),
     "chart_6months.png": (df.last("180D"), "6-Month Historical Stock Price Movements"),
     "chart_1year.png": (df, "1-Year Historical Stock Price Movements")
