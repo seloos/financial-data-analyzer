@@ -1,9 +1,10 @@
+import os
 import sqlite3
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
-# 1. Fetch stock data (1 year data covers all periods)
+# 1. Fetch stock data
 tickers = ["UBSG.SW", "AAPL"]
 print("Downloading multi-period financial data...")
 data = yf.download(tickers, period="1y", interval="1d")['Close']
@@ -19,7 +20,10 @@ df = pd.read_sql("SELECT * FROM stock_prices", conn, parse_dates=["Date"])
 conn.close()
 df.set_index("Date", inplace=True)
 
-# Function to generate and save charts for different timeframes
+# Create a 'charts' directory if it doesn't exist
+os.makedirs("charts", exist_ok=True)
+
+# Function to generate and save charts inside the 'charts' folder
 def generate_chart(subset_df, filename, title_text):
     plt.figure(figsize=(10, 5))
     plt.plot(subset_df.index, subset_df["AAPL"], label="Apple (AAPL)", color="blue")
@@ -29,7 +33,10 @@ def generate_chart(subset_df, filename, title_text):
     plt.ylabel("Closing Price (USD / CHF)")
     plt.legend()
     plt.grid(True)
-    plt.savefig(filename)
+    
+    # Save path inside charts folder
+    filepath = os.path.join("charts", filename)
+    plt.savefig(filepath)
     plt.close()
 
 # Define timeframes
@@ -40,9 +47,9 @@ periods = {
     "chart_1year.png": (df, "1-Year Historical Stock Price Movements")
 }
 
-# Generate all charts automatically
+# Generate all charts
 for filename, (subset_data, title) in periods.items():
     generate_chart(subset_data, filename, title)
-    print(f"Successfully generated: {filename}")
+    print(f"Successfully generated: charts/{filename}")
 
-print("\nAll multi-period charts updated successfully!")
+print("\nAll charts successfully organized into the 'charts' folder!")
