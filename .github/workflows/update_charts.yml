@@ -1,0 +1,33 @@
+name: Automated Stock Data & Chart Generator
+
+on:
+  schedule:
+    - cron: '0 8 * * *' # Her gün sabah saat 08:00'de otomatik çalışır
+  workflow_dispatch: # İstersen GitHub üzerinden tek tıkla elle de tetikleyebilirsin
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas numpy matplotlib
+
+      - name: Run Python script
+        run: python3 main.py
+
+      - name: Commit and push updated charts
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add stock_chart.png chart_1week.png chart_1month.png chart_6months.png chart_1year.png stock_data.db
+          git commit -m "Automated daily update of stock charts and database" || exit 0
+          git push
