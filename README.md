@@ -1,15 +1,14 @@
-# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.0)
+# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.1)
 
-An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk/momentum metrics and strategy backtests into a local **SQLite** database, and generates daily visualizations via **GitHub Actions**.
+An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk/momentum metrics and transaction-cost-adjusted strategy backtests into a local **SQLite** database, and generates daily visualizations via **GitHub Actions**.
 
 ---
 
 ## 🚀 Key Features & Architecture
 
 * **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) to execute daily at 08:00 UTC, updating the SQLite database, README metrics, and visual dashboards automatically.
-* **v2.0 Vectorized Backtesting Engine:** Simulates a regime-switching **SMA(50) Trend-Following Strategy** (`Long` when $P_t > \text{SMA}_{50,t}$, `Cash` otherwise) using a 1-day execution lag (`.shift(1)`) to strictly eliminate look-ahead bias.
+* **v2.1 Multi-Factor Backtesting & Transaction Costs:** Compares a single-factor **SMA(50)** trend strategy against a **Multi-Factor Regime Filter (SMA 50/200 + RSI)** designed to eliminate bull-market whipsaws, deducting **10 bps (0.10%)** per trade for realistic slippage and commission modeling.
 * **Unbiased Native-Calendar Math:** Computes daily returns, annualized volatility, **Sharpe Ratio**, Wilder's RSI, and moving averages on each exchange's native trading calendar (`NASDAQ` vs. `SIX`) *prior* to visual forward-filling (`ffill`).
-* **Relational Storage:** Persists raw closing prices, 14-day RSI time series, risk metrics, and backtest performance into structured SQLite tables (`stock_prices`, `stock_rsi`, `risk_metrics`, `backtest_results`).
 
 ---
 
@@ -17,16 +16,20 @@ An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitativ
 
 ```
          Latest Price (CCY)  Annual Volatility (%)  Sharpe Ratio  Max Drawdown (%)  SMA (50)  SMA (200)  Wilder's RSI (14)
-UBSG.SW               38.89                  24.07          1.29            -23.81     41.46      37.39              41.51
-AAPL                 345.98                  23.97          1.19            -13.80    331.03     294.97              59.97
+UBSG.SW               38.84                  24.07          1.28            -23.81     41.46      37.39              41.04
+AAPL                 345.90                  23.97          1.19            -13.80    331.03     294.97              59.89
 ```
 
-## 🧪 v2.0 Backtest Performance: SMA(50) Strategy vs. Buy & Hold (1-Year)
+## 🧪 v2.1 Strategy Backtest Comparison (Net of 10 bps Costs, 1-Year)
 
 ```
-         Buy & Hold Return (%)  Strategy Return (%)  Buy & Hold Sharpe  Strategy Sharpe  Buy & Hold Max DD (%)  Strategy Max DD (%)
-UBSG.SW                  32.24                48.39               1.29             2.29                 -23.81                -8.88
-AAPL                     29.18                11.40               1.19             0.64                 -13.80               -12.71
+                             Net Return (%)  Net Sharpe  Max DD (%)  Trades
+UBSG.SW (Buy & Hold)                  32.07        1.28      -23.81       1
+UBSG.SW (SMA50 Only)                  47.81        2.27       -9.04       4
+UBSG.SW (v2.1 Multi-Factor)           24.68        1.11      -19.76       3
+AAPL (Buy & Hold)                     29.15        1.19      -13.80       1
+AAPL (SMA50 Only)                      9.29        0.54      -12.79      19
+AAPL (v2.1 Multi-Factor)              25.13        1.07      -14.01       3
 ```
 
 ![Backtest Equity Curves](charts/chart_backtest.png)
@@ -34,8 +37,6 @@ AAPL                     29.18                11.40               1.19          
 ---
 
 ## 📈 Live Automated Market Dashboard
-
-*(Charts below are automatically regenerated and committed daily by GitHub Actions)*
 
 ### 1-Year Historical Performance, SMA(50/200) & Wilder's RSI
 ![1-Year Analysis](charts/chart_1year.png)
@@ -61,7 +62,6 @@ AAPL                     29.18                11.40               1.19          
 ## ⚠️ Methodology, Limitations & Disclaimer
 
 * **Look-Ahead Bias Prevention:** Strategy signals generated at Day $t$ market close are executed on Day $t+1$ returns via `signal.shift(1)`.
-* **Zero Transaction Cost Assumption:** Backtest returns represent gross performance and do not deduct brokerage commissions, bid-ask spread slippage, or interest on cash.
+* **Transaction Cost Modeling:** Every position flip (`0 -> 1` or `1 -> 0`) incurs a **10 bps (0.10%)** cost deducted directly from daily strategy returns.
 * **Wilder's Smoothing:** RSI is calculated using J. Welles Wilder's original exponential smoothing (`alpha = 1/14`).
-* **Currency Denominations (Local CCY):** Metrics are calculated in each asset's native listing currency (`AAPL` in **USD**, `UBSG.SW` in **CHF**). The backtest chart normalizes both assets to **Base = 100** for direct relative comparison.
 * **Disclaimer:** Built strictly for educational and quantitative engineering demonstration purposes. Does not constitute financial advice.

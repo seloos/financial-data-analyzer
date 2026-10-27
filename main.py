@@ -36,7 +36,9 @@ def calculate_sharpe(daily_returns_decimal):
         return 0.0
     return (daily_returns_decimal.mean() / daily_returns_decimal.std()) * np.sqrt(252)
 
-# 4. Compute Metrics & Run Vectorized Backtest on Native Trading Calendars
+# 4. Compute Metrics & Run Vectorized Backtest with Transaction Costs (10 bps = 0.10%)
+COST_BPS = 0.0010  # 0.10% commission + slippage per trade
+
 rsi_dict, sma50_dict, sma200_dict = {}, {}, {}
 vol_dict, mdd_dict, sharpe_dict, latest_price = {}, {}, {}, {}
 bt_results = {}
@@ -51,7 +53,9 @@ for ticker in tickers:
     
     # 1-Year window (252 native trading days)
     s_1y = s_clean.tail(252)
-    sma50_1y_native = sma50_s.tail(252)
+    sma50_1y_nat = sma50_s.tail(252)
+    sma200_1y_nat = sma200_s.tail(252)
+    rsi_1y_nat = rsi_s.tail(252)
     ret_1y_dec = s_1y.pct_change().dropna()
     
     vol_dict[ticker] = ret_1y_dec.std() * np.sqrt(252) * 100.0
@@ -59,26 +63,45 @@ for ticker in tickers:
     sharpe_dict[ticker] = calculate_sharpe(ret_1y_dec)
     latest_price[ticker] = s_1y.iloc[-1]
     
-    # --- v2.0 VECTORIZED BACKTEST: Trend-Following (Price > SMA 50) ---
-    # Signal = 1 (Long) when Price > SMA50, else 0 (Cash).
-    # .shift(1) strictly prevents look-ahead bias (trade executed after close).
-    signal = (s_1y > sma50_1y_native).astype(int)
-    position = signal.shift(1).loc[ret_1y_dec.index].fillna(0)
-    strat_ret_dec = position * ret_1y_dec
+    # --- STRATEGY 1: Classic SMA(50) Trend-Following ---
+    sig_sma50 = (s_1y > sma50_1y_nat).astype(int)
+    pos_sma50 = sig_sma50.shift(1).loc[ret_1y_dec.index].fillna(0)
+    trades_sma50 = pos_sma50.diff().abs().fillna(pos_sma50.iloc[0])
+    net_ret_sma50 = (pos_sma50 * ret_1y_dec) - (trades_sma50 * COST_BPS)
     
-    # Cumulative Equity Curves (Rebased to 100)
+    # --- STRATEGY 2: v2.1 Multi-Factor Regime Filter (SMA 50/200 + RSI Whipsaw Protection) ---
+    # Stay Long if Price > SMA50 OR (Price > SMA200 and RSI < 65 to survive shallow bull-market dips)
+    sig_multi = ((s_1y > sma50_1y_nat) | ((s_1y > sma200_1y_nat) & (rsi_1y_nat < 65))).astype(int)
+    pos_multi = sig_multi.shift(1).loc[ret_1y_dec.index].fillna(0)
+    trades_multi = pos_multi.diff().abs().fillna(pos_multi.iloc[0])
+    net_ret_multi = (pos_multi * ret_1y_dec) - (trades_multi * COST_BPS)
+    
+    # Cumulative Equity Curves (Rebased to 100, Net of Costs)
     bh_curve = (1.0 + ret_1y_dec).cumprod() * 100.0
-    strat_curve = (1.0 + strat_ret_dec).cumprod() * 100.0
-    bt_curves[f"{ticker}_BH"] = bh_curve
-    bt_curves[f"{ticker}_STRAT"] = strat_curve
+    sma50_curve = (1.0 + net_ret_sma50).cumprod() * 100.0
+    multi_curve = (1.0 + net_ret_multi).cumprod() * 100.0
     
-    bt_results[ticker] = {
-        "Buy & Hold Return (%)": (bh_curve.iloc[-1] - 100.0),
-        "Strategy Return (%)": (strat_curve.iloc[-1] - 100.0),
-        "Buy & Hold Sharpe": calculate_sharpe(ret_1y_dec),
-        "Strategy Sharpe": calculate_sharpe(strat_ret_dec),
-        "Buy & Hold Max DD (%)": calculate_max_drawdown(bh_curve),
-        "Strategy Max DD (%)": calculate_max_drawdown(strat_curve)
+    bt_curves[f"{ticker}_BH"] = bh_curve
+    bt_curves[f"{ticker}_SMA50"] = sma50_curve
+    bt_curves[f"{ticker}_MULTI"] = multi_curve
+    
+    bt_results[f"{ticker} (Buy & Hold)"] = {
+        "Net Return (%)": (bh_curve.iloc[-1] - 100.0),
+        "Net Sharpe": calculate_sharpe(ret_1y_dec),
+        "Max DD (%)": calculate_max_drawdown(bh_curve),
+        "Trades": 1
+    }
+    bt_results[f"{ticker} (SMA50 Only)"] = {
+        "Net Return (%)": (sma50_curve.iloc[-1] - 100.0),
+        "Net Sharpe": calculate_sharpe(net_ret_sma50),
+        "Max DD (%)": calculate_max_drawdown(sma50_curve),
+        "Trades": int(trades_sma50.sum())
+    }
+    bt_results[f"{ticker} (v2.1 Multi-Factor)"] = {
+        "Net Return (%)": (multi_curve.iloc[-1] - 100.0),
+        "Net Sharpe": calculate_sharpe(net_ret_multi),
+        "Max DD (%)": calculate_max_drawdown(multi_curve),
+        "Trades": int(trades_multi.sum())
     }
     
     rsi_dict[ticker] = rsi_s
@@ -103,10 +126,11 @@ risk_summary = pd.DataFrame({
 })
 
 backtest_summary = pd.DataFrame(bt_results).T
+backtest_summary["Trades"] = backtest_summary["Trades"].astype(int)
 
-print("\n=== v2.0 QUANTITATIVE RISK & MOMENTUM SUMMARY (1-YEAR) ===")
+print("\n=== v2.1 QUANTITATIVE RISK & MOMENTUM SUMMARY (1-YEAR) ===")
 print(risk_summary.round(2))
-print("\n=== v2.0 BACKTEST RESULTS: SMA(50) TREND-FOLLOWING VS. BUY & HOLD ===")
+print("\n=== v2.1 BACKTEST COMPARISON (NET OF 10 BPS TRANSACTION COSTS) ===")
 print(backtest_summary.round(2))
 
 # Save all tables to SQLite database
@@ -116,7 +140,7 @@ risk_summary.to_sql("risk_metrics", conn, if_exists="replace", index=True)
 backtest_summary.to_sql("backtest_results", conn, if_exists="replace", index=True)
 conn.close()
 
-# 5. Generate Multi-Timeframe Dual-Axis Charts + v2.0 Backtest Chart
+# 5. Generate Multi-Timeframe Dual-Axis Charts + v2.1 Two-Panel Backtest Chart
 os.makedirs("charts", exist_ok=True)
 
 def generate_chart(price_sub, sma50_sub, sma200_sub, rsi_sub, filename, title_text):
@@ -166,47 +190,53 @@ periods = {
 
 for filename, (p_sub, s50_sub, s200_sub, r_sub, title) in periods.items():
     generate_chart(p_sub, s50_sub, s200_sub, r_sub, filename, title)
-    print(f"Successfully generated: charts/{filename}")
 
-# Generate v2.0 Backtest & Base-100 Normalized Equity Curve Chart
-fig, ax = plt.subplots(figsize=(12, 6))
-ax.plot(bt_curves_df.index, bt_curves_df["AAPL_BH"], label="AAPL Buy & Hold (Base 100)", color="#0052cc", linestyle="--", alpha=0.6, linewidth=1.5)
-ax.plot(bt_curves_df.index, bt_curves_df["AAPL_STRAT"], label="AAPL SMA(50) Strategy", color="#0052cc", linewidth=2.2)
-ax.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_BH"], label="UBS Buy & Hold (Base 100)", color="#ff8b00", linestyle="--", alpha=0.6, linewidth=1.5)
-ax.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_STRAT"], label="UBS SMA(50) Strategy", color="#ff8b00", linewidth=2.2)
-ax.axhline(100, color="black", linestyle=":", linewidth=1)
-ax.set_title("v2.0 Vectorized Backtest: SMA(50) Trend-Following vs. Buy & Hold (Rebased = 100)", fontsize=13, fontweight="bold")
-ax.set_ylabel("Normalized Portfolio Value (Base = 100)", fontweight="bold")
-ax.set_xlabel("Date")
-ax.legend(loc="upper left", fontsize=9, ncol=2)
-ax.grid(True, linestyle="--", alpha=0.5)
+# Generate v2.1 Backtest Equity Curve Chart (Two Subplots: AAPL & UBS)
+fig, (ax_aapl, ax_ubs) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+# Top Panel: Apple Backtest
+ax_aapl.plot(bt_curves_df.index, bt_curves_df["AAPL_BH"], label="AAPL Buy & Hold", color="gray", linestyle="--", linewidth=1.5)
+ax_aapl.plot(bt_curves_df.index, bt_curves_df["AAPL_SMA50"], label="AAPL SMA(50) Only (Whipsaw Prone)", color="#00a3bf", linestyle=":", linewidth=1.8)
+ax_aapl.plot(bt_curves_df.index, bt_curves_df["AAPL_MULTI"], label="AAPL v2.1 Multi-Factor (SMA50/200 + RSI)", color="#0052cc", linewidth=2.3)
+ax_aapl.axhline(100, color="black", linestyle=":", linewidth=0.8)
+ax_aapl.set_title("v2.1 Backtest (Net of 10 bps Costs): Apple (AAPL) — Solving the Whipsaw Effect", fontsize=12, fontweight="bold")
+ax_aapl.set_ylabel("Portfolio Value (Base 100)", fontweight="bold")
+ax_aapl.legend(loc="upper left", fontsize=9)
+ax_aapl.grid(True, linestyle="--", alpha=0.5)
+
+# Bottom Panel: UBS Backtest
+ax_ubs.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_BH"], label="UBS Buy & Hold", color="gray", linestyle="--", linewidth=1.5)
+ax_ubs.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_SMA50"], label="UBS SMA(50) Only", color="#ff8b00", linewidth=2.2)
+ax_ubs.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_MULTI"], label="UBS v2.1 Multi-Factor (SMA50/200 + RSI)", color="#bf2600", linestyle="-.", linewidth=1.8)
+ax_ubs.axhline(100, color="black", linestyle=":", linewidth=0.8)
+ax_ubs.set_title("v2.1 Backtest (Net of 10 bps Costs): UBS Group (UBSG.SW) — Drawdown Protection", fontsize=12, fontweight="bold")
+ax_ubs.set_ylabel("Portfolio Value (Base 100)", fontweight="bold")
+ax_ubs.set_xlabel("Date")
+ax_ubs.legend(loc="upper left", fontsize=9)
+ax_ubs.grid(True, linestyle="--", alpha=0.5)
+
 plt.tight_layout()
 plt.savefig(os.path.join("charts", "chart_backtest.png"), dpi=120)
 plt.close()
-print("Successfully generated: charts/chart_backtest.png")
+print("Successfully updated: charts/chart_backtest.png")
 
-# 6. Auto-generate requirements.txt and README.md
-with open("requirements.txt", "w") as f:
-    f.write("yfinance>=0.2.40\npandas>=2.0.0\nnumpy>=1.24.0\nmatplotlib>=3.7.0\n")
-
+# 6. Update README.md
 readme_lines = [
-    "# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.0)\n",
-    "An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk/momentum metrics and strategy backtests into a local **SQLite** database, and generates daily visualizations via **GitHub Actions**.\n",
+    "# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.1)\n",
+    "An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk/momentum metrics and transaction-cost-adjusted strategy backtests into a local **SQLite** database, and generates daily visualizations via **GitHub Actions**.\n",
     "---\n",
     "## 🚀 Key Features & Architecture\n",
     "* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) to execute daily at 08:00 UTC, updating the SQLite database, README metrics, and visual dashboards automatically.",
-    "* **v2.0 Vectorized Backtesting Engine:** Simulates a regime-switching **SMA(50) Trend-Following Strategy** (`Long` when $P_t > \\text{SMA}_{50,t}$, `Cash` otherwise) using a 1-day execution lag (`.shift(1)`) to strictly eliminate look-ahead bias.",
-    "* **Unbiased Native-Calendar Math:** Computes daily returns, annualized volatility, **Sharpe Ratio**, Wilder's RSI, and moving averages on each exchange's native trading calendar (`NASDAQ` vs. `SIX`) *prior* to visual forward-filling (`ffill`).",
-    "* **Relational Storage:** Persists raw closing prices, 14-day RSI time series, risk metrics, and backtest performance into structured SQLite tables (`stock_prices`, `stock_rsi`, `risk_metrics`, `backtest_results`).\n",
+    "* **v2.1 Multi-Factor Backtesting & Transaction Costs:** Compares a single-factor **SMA(50)** trend strategy against a **Multi-Factor Regime Filter (SMA 50/200 + RSI)** designed to eliminate bull-market whipsaws, deducting **10 bps (0.10%)** per trade for realistic slippage and commission modeling.",
+    "* **Unbiased Native-Calendar Math:** Computes daily returns, annualized volatility, **Sharpe Ratio**, Wilder's RSI, and moving averages on each exchange's native trading calendar (`NASDAQ` vs. `SIX`) *prior* to visual forward-filling (`ffill`).\n",
     "---\n",
     "## 📊 Latest Quantitative Risk & Momentum Summary (1-Year)\n",
     "```\n" + risk_summary.round(2).to_string() + "\n```\n",
-    "## 🧪 v2.0 Backtest Performance: SMA(50) Strategy vs. Buy & Hold (1-Year)\n",
+    "## 🧪 v2.1 Strategy Backtest Comparison (Net of 10 bps Costs, 1-Year)\n",
     "```\n" + backtest_summary.round(2).to_string() + "\n```\n",
     "![Backtest Equity Curves](charts/chart_backtest.png)\n",
     "---\n",
     "## 📈 Live Automated Market Dashboard\n",
-    "*(Charts below are automatically regenerated and committed daily by GitHub Actions)*\n",
     "### 1-Year Historical Performance, SMA(50/200) & Wilder's RSI",
     "![1-Year Analysis](charts/chart_1year.png)\n",
     "### 6-Month Medium-Term Trend & Momentum",
@@ -223,13 +253,12 @@ readme_lines = [
     "---\n",
     "## ⚠️ Methodology, Limitations & Disclaimer\n",
     "* **Look-Ahead Bias Prevention:** Strategy signals generated at Day $t$ market close are executed on Day $t+1$ returns via `signal.shift(1)`.",
-    "* **Zero Transaction Cost Assumption:** Backtest returns represent gross performance and do not deduct brokerage commissions, bid-ask spread slippage, or interest on cash.",
+    "* **Transaction Cost Modeling:** Every position flip (`0 -> 1` or `1 -> 0`) incurs a **10 bps (0.10%)** cost deducted directly from daily strategy returns.",
     "* **Wilder's Smoothing:** RSI is calculated using J. Welles Wilder's original exponential smoothing (`alpha = 1/14`).",
-    "* **Currency Denominations (Local CCY):** Metrics are calculated in each asset's native listing currency (`AAPL` in **USD**, `UBSG.SW` in **CHF**). The backtest chart normalizes both assets to **Base = 100** for direct relative comparison.",
     "* **Disclaimer:** Built strictly for educational and quantitative engineering demonstration purposes. Does not constitute financial advice.\n"
 ]
 
 with open("README.md", "w") as f:
     f.write("\n".join(readme_lines))
 
-print("\nv2.0 Pipeline, Backtest Engine, and README.md generated successfully!")
+print("\nv2.1 Multi-Factor Backtest and README updated successfully!")
