@@ -1,35 +1,33 @@
 # 📈 Quantitative Financial Data Pipeline & Risk Analyzer
 
-An automated end-to-end **ETL (Extract, Transform, Load) pipeline** and quantitative technical analysis tool built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, stores historical time-series and risk metrics in a local **SQLite** database, and generates multi-timeframe dual-axis visualizations updated daily via **GitHub Actions**.
+An automated end-to-end **ETL (Extract, Transform, Load) pipeline** and quantitative technical analysis tool built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk and momentum metrics into a local **SQLite** database, and generates multi-timeframe dual-axis visualizations updated daily via **GitHub Actions**.
 
 ---
 
 ## 🚀 Key Features & Architecture
 
-* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) to execute daily at 08:00 UTC, ensuring the SQLite database and visual dashboards remain continuously updated without manual intervention.
-* **Cross-Market Data Cleaning:** Implements forward-filling (`ffill`) across US (NASDAQ) and Swiss (SIX) market calendars to prevent holiday-induced `NaN` gaps in rolling window calculations.
-* **Dual-Axis Visualization (`twinx`):** Simultaneously plots equities across different currencies and price scales (**USD** vs. **CHF**) alongside **50-Day** and **200-Day Simple Moving Averages (SMA)**.
+* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) to execute daily at 08:00 UTC, updating the SQLite database and visual dashboards without manual intervention.
+* **Unbiased Native-Calendar Math:** Computes daily returns, annualized volatility, Wilder's RSI, and moving averages on each exchange's native trading calendar (`NASDAQ` vs. `SIX`) *prior* to visual forward-filling (`ffill`), preventing artificial zero-return volatility dampening on cross-market holidays.
+* **Dual-Axis Visualization (`twinx`):** Simultaneously plots equities across different currencies and nominal price scales (**USD** vs. **CHF**) alongside **50-Day** and **200-Day Simple Moving Averages (SMA)**.
 * **Relational Storage:** Persists raw closing prices, 14-day RSI time series, and summary risk metrics into structured SQLite tables (`stock_prices`, `stock_rsi`, `risk_metrics`).
 
 ---
 
-## 🧮 Quantitative Metrics Implemented
+## 📊 Latest Quantitative Risk & Momentum Summary (1-Year)
 
-1. **Annualized Volatility ($\sigma_{\text{annual}}$):** Measures the dispersion of daily returns scaled to 252 trading days:
-   $$\sigma_{\text{annual}} = \sigma_{\text{daily}} \times \sqrt{252}$$
-2. **Maximum Drawdown ($\text{Max DD}$):** Captures tail risk by measuring the largest peak-to-trough percentage decline over the 1-year horizon:
-   $$\text{Drawdown}_t = \frac{P_t - \max_{\tau \in [0,t]} P_\tau}{\max_{\tau \in [0,t]} P_\tau} \times 100$$
-3. **14-Day Relative Strength Index ($\text{RSI}$):** Momentum oscillator identifying overbought ($>70$) and oversold ($<30$) regimes:
-   $$\text{RSI} = 100 - \left( \frac{100}{1 + \frac{\text{Avg Gain}_{14}}{\text{Avg Loss}_{14}}} \right)$$
-4. **Simple Moving Averages ($\text{SMA}_{50}$ & $\text{SMA}_{200}$):** Tracks medium- and long-term institutional trend support and Golden/Death Cross regimes.
+```
+         Latest Price (Local CCY)  Annualized Volatility (%)  Max Drawdown (%)  SMA (50)  SMA (200)  Wilder's RSI (14)
+UBSG.SW                     38.77                      24.07            -23.81     41.46      37.39              40.38
+AAPL                       343.91                      24.07            -13.80    330.23     294.54              57.70
+```
 
 ---
 
-## 📊 Live Automated Market Dashboard
+## 📈 Live Automated Market Dashboard
 
 *(Charts below are automatically regenerated and committed daily by GitHub Actions)*
 
-### 1-Year Historical Performance, SMA(50/200) & RSI
+### 1-Year Historical Performance, SMA(50/200) & Wilder's RSI
 ![1-Year Analysis](charts/chart_1year.png)
 
 ### 6-Month Medium-Term Trend & Momentum
@@ -42,7 +40,26 @@ An automated end-to-end **ETL (Extract, Transform, Load) pipeline** and quantita
 
 ---
 
-## 🛠️ Tech Stack
-* **Language:** Python 3.9
-* **Libraries:** `pandas`, `yfinance`, `matplotlib`, `sqlite3`
-* **Automation / DevOps:** GitHub Actions (Ubuntu Runner, Cron Scheduling)
+## ⚙️ How to Run Locally
+
+1. Clone the repository: `git clone [https://github.com/seloos/financial-data-analyzer.git](https://github.com/seloos/financial-data-analyzer.git)`
+2. Install dependencies: `pip3 install -r requirements.txt`
+3. Run the pipeline: `python3 main.py`
+
+---
+
+## ⚠️ Methodology, Limitations & Disclaimer
+
+* **Wilder's Smoothing:** RSI is calculated using J. Welles Wilder's original exponential smoothing (`alpha = 1/14`) rather than a simple rolling mean, aligning values with institutional terminals.
+* **Currency Denominations (Local CCY):** Returns, volatility, and moving averages are calculated in each asset's native listing currency (`AAPL` in **USD**, `UBSG.SW` in **CHF**) without FX conversion.
+* **Dual Y-Axis Scaling:** Charts utilize a dual Y-axis (`twinx`) to preserve nominal price levels and exact SMA crossover points. Refer to the summary table above for direct risk-adjusted percentage comparisons.
+* **Database Artifact:** `stock_data.db` is committed directly to the repository as an inspectable snapshot updated by GitHub Actions. Running `python3 main.py` locally regenerates this file.
+* **Disclaimer:** Built strictly for educational and quantitative engineering demonstration purposes. Data is sourced via `yfinance` and does not constitute financial advice.
+
+---
+
+## 🔮 Future Roadmap
+
+* **Risk-Adjusted Return Ratios:** Implement annualized **Sharpe Ratio** and **Sortino Ratio** using US Treasury / SARON risk-free benchmarks.
+* **Normalized Relative Performance:** Add a base-100 (`Rebased = 100`) FX-adjusted comparison chart.
+* **Vectorized Backtesting:** Build a historical crossover strategy backtester (SMA 50/200 Golden Cross + RSI filter).
