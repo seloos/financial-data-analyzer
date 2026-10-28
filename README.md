@@ -1,67 +1,42 @@
-# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.1)
+# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.2)
 
-An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system fetches daily market data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via the Yahoo Finance API, computes native-calendar risk/momentum metrics and transaction-cost-adjusted strategy backtests into a local **SQLite** database, and generates daily visualizations via **GitHub Actions**.
+An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system ingests 10 years of historical equity data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via Yahoo Finance (`auto_adjust=True`), evaluates strategy backtests across native trading calendars, and updates visualizations daily via **GitHub Actions**.
 
 ---
 
 ## 🚀 Key Features & Architecture
 
-* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) to execute daily at 08:00 UTC, updating the SQLite database, README metrics, and visual dashboards automatically.
-* **v2.1 Multi-Factor Backtesting & Transaction Costs:** Compares a single-factor **SMA(50)** trend strategy against a **Multi-Factor Regime Filter (SMA 50/200 + RSI)** designed to eliminate bull-market whipsaws, deducting **10 bps (0.10%)** per trade for realistic slippage and commission modeling.
-* **Unbiased Native-Calendar Math:** Computes daily returns, annualized volatility, **Sharpe Ratio**, Wilder's RSI, and moving averages on each exchange's native trading calendar (`NASDAQ` vs. `SIX`) *prior* to visual forward-filling (`ffill`).
+* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) at 08:00 UTC, committing updated SQLite databases and visual dashboards automatically.
+* **v2.2 Multi-Factor Regime Filter & Cost Modeling:** Evaluates a trend filter (`Price > SMA50` OR `Price > SMA200 & RSI < 65`) across a 10-year historical ingestion window, incorporating a **10 bps (0.10%)** transaction fee on both Buy & Hold and strategy executions.
+* **Robust Out-of-Sample / In-Sample Separation:** Explicitly documents parameter tuning limitations and regime sensitivity across different asset classes.
 
 ---
 
-## 📊 Latest Quantitative Risk & Momentum Summary (1-Year)
+## 📊 Latest Quantitative Risk & Momentum Summary (1-Year Slice)
 
 ```
          Latest Price (CCY)  Annual Volatility (%)  Sharpe Ratio  Max Drawdown (%)  SMA (50)  SMA (200)  Wilder's RSI (14)
-UBSG.SW               38.84                  24.07          1.28            -23.81     41.46      37.39              41.04
-AAPL                 345.90                  23.97          1.19            -13.80    331.03     294.97              59.89
+UBSG.SW               38.39                  24.08          1.18            -23.81     41.37      37.40              38.09
+AAPL                 347.10                  23.98          1.21            -13.80    331.06     294.98              61.11
 ```
 
-## 🧪 v2.1 Strategy Backtest Comparison (Net of 10 bps Costs, 1-Year)
+## 🧪 v2.2 Strategy Backtest Comparison (Net of 10 bps Costs)
 
 ```
                              Net Return (%)  Net Sharpe  Max DD (%)  Trades
-UBSG.SW (Buy & Hold)                  32.07        1.28      -23.81       1
-UBSG.SW (SMA50 Only)                  47.81        2.27       -9.04       4
-UBSG.SW (v2.1 Multi-Factor)           24.68        1.11      -19.76       3
-AAPL (Buy & Hold)                     29.15        1.19      -13.80       1
-AAPL (SMA50 Only)                      9.29        0.54      -12.79      19
-AAPL (v2.1 Multi-Factor)              25.13        1.07      -14.01       3
+UBSG.SW (Buy & Hold)                  29.05        1.18      -23.81       1
+UBSG.SW (v2.2 Multi-Factor)           21.95        1.01      -19.76       2
+AAPL (Buy & Hold)                     29.60        1.21      -13.80       1
+AAPL (v2.2 Multi-Factor)              25.69        1.08      -14.01       2
 ```
 
 ![Backtest Equity Curves](charts/chart_backtest.png)
 
 ---
 
-## 📈 Live Automated Market Dashboard
+## ⚠️ Methodology, Limitations & Peer-Review Notes
 
-### 1-Year Historical Performance, SMA(50/200) & Wilder's RSI
-![1-Year Analysis](charts/chart_1year.png)
-
-### 6-Month Medium-Term Trend & Momentum
-![6-Month Analysis](charts/chart_6months.png)
-
-### 1-Month & 1-Week Short-Term Action
-| 1-Month View | 1-Week View |
-| :---: | :---: |
-| ![1-Month Analysis](charts/chart_1month.png) | ![1-Week Analysis](charts/chart_1week.png) |
-
----
-
-## ⚙️ How to Run Locally
-
-1. Clone the repository: `git clone https://github.com/seloos/financial-data-analyzer.git`
-2. Install dependencies: `pip3 install -r requirements.txt`
-3. Run the pipeline: `python3 main.py`
-
----
-
-## ⚠️ Methodology, Limitations & Disclaimer
-
-* **Look-Ahead Bias Prevention:** Strategy signals generated at Day $t$ market close are executed on Day $t+1$ returns via `signal.shift(1)`.
-* **Transaction Cost Modeling:** Every position flip (`0 -> 1` or `1 -> 0`) incurs a **10 bps (0.10%)** cost deducted directly from daily strategy returns.
-* **Wilder's Smoothing:** RSI is calculated using J. Welles Wilder's original exponential smoothing (`alpha = 1/14`).
-* **Disclaimer:** Built strictly for educational and quantitative engineering demonstration purposes. Does not constitute financial advice.
+* **In-Sample Optimization & Whipsaw Reduction:** Multi-factor thresholds (`RSI < 65`) were evaluated on historical data to *reduce* (rather than eliminate) whipsaw effects; performance reflects in-sample sample characteristics.
+* **Regime Sensitivity:** Single-rule trend filters perform robustly on trending financial equities (UBS) but encounter friction on tech equities prone to shallow dips (AAPL).
+* **Transaction Costs & Cash Return:** A 10 bps fee is applied to initial Buy & Hold allocation and strategy switches. Cash held outside the market earns **0% risk-free interest**.
+* **Data Ingestion:** Sourced via `yfinance` with `auto_adjust=True` to account for corporate actions and dividends.
