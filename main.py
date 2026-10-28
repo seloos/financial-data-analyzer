@@ -1,158 +1,202 @@
+"""
+Financial Data Analyzer v2.3
+ETL (Yahoo Finance -> SQLite) + risk metrics + transparent backtest.
+Writes charts/, requirements.txt and README.md on every run (GitHub Actions runs it daily).
+"""
 import os
 import sqlite3
+from datetime import datetime, timezone
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe (GitHub Actions)
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
 
-# 1. Fetch 10 years of historical data for robust out-of-sample/in-sample backtesting
-tickers = ["UBSG.SW", "AAPL"]
-print("Downloading 10-year financial data from Yahoo Finance...")
-# Explicitly setting auto_adjust=True ensures dividend and split adjusted Close prices
-raw_data = yf.download(tickers, period="10y", interval="1d", auto_adjust=True)['Close']
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+TICKERS = ["UBSG.SW", "AAPL"]
+PERIOD = "10y"
+COST = 0.0010          # 10 bps per position change (commission + slippage)
+RSI_THRESHOLD = 65     # chosen AFTER looking at the last year -> see README limitations
+DASH_DAYS = 252        # ~1 trading year: dashboard window and "tuning window"
 
-# 2. Save raw unadjusted/adjusted prices to SQLite database
+STRATEGIES = ["Buy & Hold", "SMA50 Only", "Multi-Factor", "Multi-Factor w/o RSI"]
+STYLE = {  # colour, linestyle, linewidth
+    "Buy & Hold": ("gray", "--", 1.6),
+    "SMA50 Only": ("#ff8b00", "-", 1.6),
+    "Multi-Factor": ("#0052cc", "-", 2.2),
+    "Multi-Factor w/o RSI": ("#6554c0", ":", 1.8),
+}
+LAST_LABEL = f"Last {DASH_DAYS} days"
+
+# ---------------------------------------------------------------------------
+# 1. Fetch data (adjusted close = splits + dividends)
+# ---------------------------------------------------------------------------
+print(f"Downloading {PERIOD} of daily data from Yahoo Finance...")
+raw_data = yf.download(TICKERS, period=PERIOD, interval="1d", auto_adjust=True)["Close"]
+if raw_data is None or raw_data.empty:
+    raise SystemExit("No data returned from Yahoo Finance.")
+raw_data = raw_data[TICKERS]
+
 conn = sqlite3.connect("stock_data.db")
 raw_data.to_sql("stock_prices", conn, if_exists="replace", index=True)
 conn.close()
 
-# 3. Quantitative Functions (Wilder's RSI, Max Drawdown, Sharpe Ratio)
-def calculate_wilders_rsi(series, period=14):
+
+# ---------------------------------------------------------------------------
+# 2. Quantitative helpers
+# ---------------------------------------------------------------------------
+def wilders_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi.fillna(100.0)
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss  # avg_loss == 0 -> inf -> RSI 100; warm-up stays NaN
+    return 100.0 - 100.0 / (1.0 + rs)
 
-def calculate_max_drawdown(series):
+
+def max_drawdown(series):
     rolling_max = series.cummax()
-    drawdown = (series - rolling_max) / rolling_max * 100.0
-    return drawdown.min()
+    return ((series - rolling_max) / rolling_max * 100.0).min()
 
-def calculate_sharpe(daily_returns_decimal):
-    if daily_returns_decimal.std() == 0:
-        return 0.0
-    return (daily_returns_decimal.mean() / daily_returns_decimal.std()) * np.sqrt(252)
 
-# 4. Compute Metrics & Run Vectorized Backtest on 10-Year Horizon (Evaluated on Last 252 Days for Dashboard)
-COST_BPS = 0.0010  # 10 bps transaction cost
+def sharpe(daily_returns):
+    sd = daily_returns.std()
+    return 0.0 if sd == 0 or np.isnan(sd) else daily_returns.mean() / sd * np.sqrt(252)
 
-rsi_dict, sma50_dict, sma200_dict = {}, {}, {}
-vol_dict, mdd_dict, sharpe_dict, latest_price = {}, {}, {}, {}
-bt_results = {}
-bt_curves = {}
 
-for ticker in tickers:
-    s_clean = raw_data[ticker].dropna()
-    
-    rsi_s = calculate_wilders_rsi(s_clean, 14)
-    sma50_s = s_clean.rolling(window=50, min_periods=50).mean()
-    sma200_s = s_clean.rolling(window=200, min_periods=200).mean()
-    
-    # Run backtest across the ENTIRE 10-year history for robust statistical significance
-    ret_full_dec = s_clean.pct_change().dropna()
-    sig_multi = ((s_clean > sma50_s) | ((s_clean > sma200_s) & (rsi_s < 65))).astype(int)
-    pos_multi = sig_multi.shift(1).loc[ret_full_dec.index].fillna(0)
-    trades_multi = pos_multi.diff().abs().fillna(pos_multi.iloc[0])
-    
-    # Apply entry cost consistently to Buy & Hold (1 trade at start) and Strategy
-    trades_bh = pd.Series(0.0, index=ret_full_dec.index)
-    trades_bh.iloc[0] = 1.0
-    
-    net_ret_bh = (1.0 * ret_full_dec) - (trades_bh * COST_BPS)
-    net_ret_multi = (pos_multi * ret_full_dec) - (trades_multi * COST_BPS)
-    
-    # Slice last 252 trading days (1 year) for dashboard reporting and visualization
-    s_1y = s_clean.tail(252)
-    ret_1y_dec = s_1y.pct_change().dropna()
-    
-    vol_dict[ticker] = ret_1y_dec.std() * np.sqrt(252) * 100.0
-    mdd_dict[ticker] = calculate_max_drawdown(s_1y)
-    sharpe_dict[ticker] = calculate_sharpe(ret_1y_dec)
-    latest_price[ticker] = s_1y.iloc[-1]
-    
-    bh_curve_1y = (1.0 + net_ret_bh.loc[ret_1y_dec.index]).cumprod() * 100.0
-    multi_curve_1y = (1.0 + net_ret_multi.loc[ret_1y_dec.index]).cumprod() * 100.0
-    
-    bt_curves[f"{ticker}_BH"] = bh_curve_1y
-    bt_curves[f"{ticker}_MULTI"] = multi_curve_1y
-    
-    bt_results[f"{ticker} (Buy & Hold)"] = {
-        "Net Return (%)": (bh_curve_1y.iloc[-1] - 100.0),
-        "Net Sharpe": calculate_sharpe(net_ret_bh.loc[ret_1y_dec.index]),
-        "Max DD (%)": calculate_max_drawdown(bh_curve_1y),
-        "Trades": int(trades_bh.sum())
+def run_segment(ret, pos):
+    """Run one strategy on one segment as a fresh start (entry cost included)."""
+    trades = pos.diff().abs()
+    trades.iloc[0] = pos.iloc[0]
+    net = pos * ret - trades * COST
+    curve = (1.0 + net).cumprod() * 100.0
+    years = len(net) / 252.0
+    stats = {
+        "Net Return (%)": curve.iloc[-1] - 100.0,
+        "Ann. Return (%)": ((curve.iloc[-1] / 100.0) ** (1.0 / years) - 1.0) * 100.0,
+        "Net Sharpe": sharpe(net),
+        "Max DD (%)": max_drawdown(curve),
+        "Trades": int(trades.sum()),
+        "In Market (%)": pos.mean() * 100.0,
     }
-    bt_results[f"{ticker} (v2.2 Multi-Factor)"] = {
-        "Net Return (%)": (multi_curve_1y.iloc[-1] - 100.0),
-        "Net Sharpe": calculate_sharpe(net_ret_multi.loc[ret_1y_dec.index]),
-        "Max DD (%)": calculate_max_drawdown(multi_curve_1y),
-        "Trades": int(trades_multi.loc[ret_1y_dec.index].sum())
+    return curve, stats
+
+
+# ---------------------------------------------------------------------------
+# 3. Indicators, risk metrics and backtest (each ticker on its own calendar)
+# ---------------------------------------------------------------------------
+indicators, risk, rows, curves, period_text = {}, {}, [], {}, []
+
+for t in TICKERS:
+    s = raw_data[t].dropna()
+    rsi = wilders_rsi(s, 14)
+    sma50 = s.rolling(50, min_periods=50).mean()
+    sma200 = s.rolling(200, min_periods=200).mean()
+    indicators[t] = (rsi, sma50, sma200)
+
+    # Risk metrics: last DASH_DAYS trading days
+    s_1y = s.tail(DASH_DAYS)
+    r_1y = s_1y.pct_change().dropna()
+    risk[t] = {
+        "Latest Price (CCY)": s_1y.iloc[-1],
+        "Annual Volatility (%)": r_1y.std() * np.sqrt(252) * 100.0,
+        "Sharpe Ratio": sharpe(r_1y),
+        "Max Drawdown (%)": max_drawdown(s_1y),
+        "SMA (50)": sma50.iloc[-1],
+        "SMA (200)": sma200.iloc[-1],
+        "Wilder's RSI (14)": rsi.iloc[-1],
     }
-    
-    rsi_dict[ticker] = rsi_s.tail(252)
-    sma50_dict[ticker] = sma50_s.tail(252)
-    sma200_dict[ticker] = sma200_s.tail(252)
 
-df_plot = raw_data.tail(252).ffill().dropna()
-rsi_1y = pd.DataFrame(rsi_dict).reindex(df_plot.index).ffill()
-sma50_1y = pd.DataFrame(sma50_dict).reindex(df_plot.index).ffill()
-sma200_1y = pd.DataFrame(sma200_dict).reindex(df_plot.index).ffill()
-bt_curves_df = pd.DataFrame(bt_curves).reindex(df_plot.index).ffill().bfill()
+    # Backtest: all strategies (and Buy & Hold) cover the SAME dates, starting
+    # once the SMA(200) exists, so nobody is penalised for warm-up.
+    first_valid = sma200.first_valid_index()
+    ret = s.pct_change().dropna()
+    ret = ret.loc[ret.index > first_valid]
+    if len(ret) <= 2 * DASH_DAYS:
+        raise SystemExit(f"Not enough history for {t} (need more than {2 * DASH_DAYS} backtest days).")
 
-risk_summary = pd.DataFrame({
-    "Latest Price (CCY)": pd.Series(latest_price),
-    "Annual Volatility (%)": pd.Series(vol_dict),
-    "Sharpe Ratio": pd.Series(sharpe_dict),
-    "Max Drawdown (%)": pd.Series(mdd_dict),
-    "SMA (50)": sma50_1y.iloc[-1],
-    "SMA (200)": sma200_1y.iloc[-1],
-    "Wilder's RSI (14)": rsi_1y.iloc[-1]
-})
+    signals = {
+        "Buy & Hold": pd.Series(1.0, index=s.index),
+        "SMA50 Only": (s > sma50).astype(float),
+        "Multi-Factor": ((s > sma50) | ((s > sma200) & (rsi < RSI_THRESHOLD))).astype(float),
+        "Multi-Factor w/o RSI": ((s > sma50) | (s > sma200)).astype(float),  # ablation
+    }
+    # Signal at close of day t is executed on day t+1 returns (no look-ahead)
+    positions = {n: sg.shift(1).reindex(ret.index).fillna(0.0) for n, sg in signals.items()}
 
-backtest_summary = pd.DataFrame(bt_results).T
-backtest_summary["Trades"] = backtest_summary["Trades"].astype(int)
+    idx = ret.index
+    segments = {
+        "Full period": idx,
+        "Older period": idx[:-DASH_DAYS],
+        LAST_LABEL: idx[-DASH_DAYS:],
+    }
+    period_text.append(f"{t}: {idx[0].date()} to {idx[-1].date()}")
+    for seg_name, seg_idx in segments.items():
+        for name in STRATEGIES:
+            curve, stats = run_segment(ret.loc[seg_idx], positions[name].loc[seg_idx])
+            rows.append({"Ticker": t, "Strategy": name, "Segment": seg_name, **stats})
+            curves.setdefault((t, seg_name), {})[name] = curve
 
-print("\n=== v2.2 QUANTITATIVE RISK & MOMENTUM SUMMARY (1-YEAR SLICE) ===")
+results = pd.DataFrame(rows)
+risk_summary = pd.DataFrame(risk).T
+
+# Dashboard series on a unified calendar (forward-fill for plotting only)
+df_plot = raw_data.ffill().dropna().tail(DASH_DAYS)
+rsi_1y = pd.DataFrame({t: indicators[t][0] for t in TICKERS}).reindex(df_plot.index).ffill()
+sma50_1y = pd.DataFrame({t: indicators[t][1] for t in TICKERS}).reindex(df_plot.index).ffill()
+sma200_1y = pd.DataFrame({t: indicators[t][2] for t in TICKERS}).reindex(df_plot.index).ffill()
+
+
+def seg_table(seg):
+    d = results[results["Segment"] == seg].drop(columns="Segment").set_index(["Ticker", "Strategy"])
+    return d.round(2).to_string()
+
+
+print("\n=== RISK & MOMENTUM SUMMARY (LAST 252 DAYS) ===")
 print(risk_summary.round(2))
-print("\n=== v2.2 10-YEAR BACKTEST EVALUATED ON 1-YEAR SLICE (NET OF 10 BPS) ===")
-print(backtest_summary.round(2))
+for seg in ["Full period", "Older period", LAST_LABEL]:
+    print(f"\n=== BACKTEST: {seg.upper()} (NET OF {COST * 1e4:.0f} BPS) ===")
+    print(seg_table(seg))
 
-# Save all tables to SQLite database
 conn = sqlite3.connect("stock_data.db")
 rsi_1y.to_sql("stock_rsi", conn, if_exists="replace", index=True)
 risk_summary.to_sql("risk_metrics", conn, if_exists="replace", index=True)
-backtest_summary.to_sql("backtest_results", conn, if_exists="replace", index=True)
+results.to_sql("backtest_results", conn, if_exists="replace", index=False)
 conn.close()
 
-# 5. Generate Charts
+# ---------------------------------------------------------------------------
+# 4. Charts
+# ---------------------------------------------------------------------------
 os.makedirs("charts", exist_ok=True)
 
+
 def generate_chart(price_sub, sma50_sub, sma200_sub, rsi_sub, filename, title_text):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [2.2, 1]})
-    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True,
+                                   gridspec_kw={"height_ratios": [2.2, 1]})
     l1 = ax1.plot(price_sub.index, price_sub["AAPL"], label="AAPL Price (USD)", color="#0052cc", linewidth=2)
     l2 = ax1.plot(sma50_sub.index, sma50_sub["AAPL"], label="AAPL SMA(50)", color="#00a3bf", linestyle="--", linewidth=1.5)
     l3 = ax1.plot(sma200_sub.index, sma200_sub["AAPL"], label="AAPL SMA(200)", color="#6554c0", linestyle=":", linewidth=2)
     ax1.set_ylabel("Apple Price (USD)", color="#0052cc", fontweight="bold")
-    ax1.tick_params(axis='y', labelcolor="#0052cc")
+    ax1.tick_params(axis="y", labelcolor="#0052cc")
     ax1.grid(True, linestyle="--", alpha=0.5)
-    
-    ax1_right = ax1.twinx()
-    l4 = ax1_right.plot(price_sub.index, price_sub["UBSG.SW"], label="UBS Price (CHF)", color="#ff8b00", linewidth=2)
-    l5 = ax1_right.plot(sma50_sub.index, sma50_sub["UBSG.SW"], label="UBS SMA(50)", color="#ff5630", linestyle="--", linewidth=1.5)
-    l6 = ax1_right.plot(sma200_sub.index, sma200_sub["UBSG.SW"], label="UBS SMA(200)", color="#bf2600", linestyle=":", linewidth=2)
-    ax1_right.set_ylabel("UBS Zürich Price (CHF)", color="#ff8b00", fontweight="bold")
-    ax1_right.tick_params(axis='y', labelcolor="#ff8b00")
-    
+
+    ax1r = ax1.twinx()
+    l4 = ax1r.plot(price_sub.index, price_sub["UBSG.SW"], label="UBS Price (CHF)", color="#ff8b00", linewidth=2)
+    l5 = ax1r.plot(sma50_sub.index, sma50_sub["UBSG.SW"], label="UBS SMA(50)", color="#ff5630", linestyle="--", linewidth=1.5)
+    l6 = ax1r.plot(sma200_sub.index, sma200_sub["UBSG.SW"], label="UBS SMA(200)", color="#bf2600", linestyle=":", linewidth=2)
+    ax1r.set_ylabel("UBS Zürich Price (CHF)", color="#ff8b00", fontweight="bold")
+    ax1r.tick_params(axis="y", labelcolor="#ff8b00")
+
     lines = l1 + l2 + l3 + l4 + l5 + l6
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="upper left", fontsize=8.5, ncol=2, framealpha=0.9)
+    ax1.legend(lines, [ln.get_label() for ln in lines], loc="upper left", fontsize=8.5, ncol=2, framealpha=0.9)
     ax1.set_title(title_text, fontsize=13, fontweight="bold")
-    
+
     ax2.plot(rsi_sub.index, rsi_sub["AAPL"], label="AAPL Wilder's RSI (14)", color="#0052cc", linewidth=1.5)
     ax2.plot(rsi_sub.index, rsi_sub["UBSG.SW"], label="UBSG.SW Wilder's RSI (14)", color="#ff8b00", linewidth=1.5)
     ax2.axhline(70, color="red", linestyle="--", linewidth=1, label="Overbought (70)")
@@ -164,73 +208,133 @@ def generate_chart(price_sub, sma50_sub, sma200_sub, rsi_sub, filename, title_te
     ax2.set_xlabel("Date")
     ax2.legend(loc="upper left", fontsize=8, ncol=2)
     ax2.grid(True, linestyle="--", alpha=0.5)
-    
+
     plt.tight_layout()
     plt.savefig(os.path.join("charts", filename), dpi=120)
-    plt.close()
+    plt.close(fig)
+
 
 periods = {
-    "chart_1week.png": (df_plot.tail(5), sma50_1y.tail(5), sma200_1y.tail(5), rsi_1y.tail(5), "1-Week Price, SMA(50/200) & Wilder's RSI"),
-    "chart_1month.png": (df_plot.tail(21), sma50_1y.tail(21), sma200_1y.tail(21), rsi_1y.tail(21), "1-Month Price, SMA(50/200) & Wilder's RSI"),
-    "chart_6months.png": (df_plot.tail(126), sma50_1y.tail(126), sma200_1y.tail(126), rsi_1y.tail(126), "6-Month Price, SMA(50/200) & Wilder's RSI"),
-    "chart_1year.png": (df_plot, sma50_1y, sma200_1y, rsi_1y, "1-Year Price, SMA(50/200) & Wilder's RSI")
+    "chart_1week.png": (5, "1-Week Price, SMA(50/200) & Wilder's RSI"),
+    "chart_1month.png": (21, "1-Month Price, SMA(50/200) & Wilder's RSI"),
+    "chart_6months.png": (126, "6-Month Price, SMA(50/200) & Wilder's RSI"),
+    "chart_1year.png": (DASH_DAYS, "1-Year Price, SMA(50/200) & Wilder's RSI"),
 }
+for fname, (n, title) in periods.items():
+    generate_chart(df_plot.tail(n), sma50_1y.tail(n), sma200_1y.tail(n), rsi_1y.tail(n), fname, title)
 
-for filename, (p_sub, s50_sub, s200_sub, r_sub, title) in periods.items():
-    generate_chart(p_sub, s50_sub, s200_sub, r_sub, filename, title)
 
-# Generate Backtest Equity Curve Chart
-fig, (ax_aapl, ax_ubs) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+def plot_backtest(segment, filename, heading, log_scale=False, mark_tuning=False):
+    fig, axes = plt.subplots(len(TICKERS), 1, figsize=(12, 4.6 * len(TICKERS)))
+    for ax, t in zip(axes, TICKERS):
+        for name, curve in curves[(t, segment)].items():
+            color, ls, lw = STYLE[name]
+            ax.plot(curve.index, curve.values, label=name, color=color, linestyle=ls, linewidth=lw)
+        if mark_tuning:
+            start = curves[(t, LAST_LABEL)]["Buy & Hold"].index[0]
+            ax.axvline(start, color="black", linestyle="-.", linewidth=1,
+                       label=f"{LAST_LABEL} (RSI threshold chosen here)")
+        ax.axhline(100, color="black", linestyle=":", linewidth=0.8)
+        if log_scale:
+            ax.set_yscale("log")
+            ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 3, 5), numticks=12))
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+            ax.yaxis.set_minor_formatter(NullFormatter())
+        ax.set_title(f"{heading}: {t} (net of {COST * 1e4:.0f} bps costs"
+                     f"{', log scale' if log_scale else ''})", fontsize=12, fontweight="bold")
+        ax.set_ylabel("Portfolio Value (Base 100)", fontweight="bold")
+        ax.legend(loc="upper left", fontsize=9)
+        ax.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(os.path.join("charts", filename), dpi=120)
+    plt.close(fig)
 
-ax_aapl.plot(bt_curves_df.index, bt_curves_df["AAPL_BH"], label="AAPL Buy & Hold", color="gray", linestyle="--", linewidth=1.5)
-ax_aapl.plot(bt_curves_df.index, bt_curves_df["AAPL_MULTI"], label="AAPL v2.2 Multi-Factor Strategy", color="#0052cc", linewidth=2.3)
-ax_aapl.axhline(100, color="black", linestyle=":", linewidth=0.8)
-ax_aapl.set_title("v2.2 Backtest (Net of 10 bps Costs): Apple (AAPL)", fontsize=12, fontweight="bold")
-ax_aapl.set_ylabel("Portfolio Value (Base 100)", fontweight="bold")
-ax_aapl.legend(loc="upper left", fontsize=9)
-ax_aapl.grid(True, linestyle="--", alpha=0.5)
 
-ax_ubs.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_BH"], label="UBS Buy & Hold", color="gray", linestyle="--", linewidth=1.5)
-ax_ubs.plot(bt_curves_df.index, bt_curves_df["UBSG.SW_MULTI"], label="UBS v2.2 Multi-Factor Strategy", color="#bf2600", linewidth=1.8)
-ax_ubs.axhline(100, color="black", linestyle=":", linewidth=0.8)
-ax_ubs.set_title("v2.2 Backtest (Net of 10 bps Costs): UBS Group (UBSG.SW)", fontsize=12, fontweight="bold")
-ax_ubs.set_ylabel("Portfolio Value (Base 100)", fontweight="bold")
-ax_ubs.set_xlabel("Date")
-ax_ubs.legend(loc="upper left", fontsize=9)
-ax_ubs.grid(True, linestyle="--", alpha=0.5)
+plot_backtest("Full period", "chart_backtest.png", "Backtest, full period", log_scale=True, mark_tuning=True)
+plot_backtest(LAST_LABEL, "chart_backtest_1y.png", f"Backtest, {LAST_LABEL.lower()}")
 
-plt.tight_layout()
-plt.savefig(os.path.join("charts", "chart_backtest.png"), dpi=120)
-plt.close()
-
-# 6. Update requirements.txt
+# ---------------------------------------------------------------------------
+# 5. requirements.txt and README.md
+# ---------------------------------------------------------------------------
 with open("requirements.txt", "w") as f:
     f.write("yfinance>=0.2.40\npandas>=2.0.0\nnumpy>=1.24.0\nmatplotlib>=3.7.0\n")
 
-# 7. Update README.md with honest, professional peer-review disclosures
-readme_lines = [
-    "# 📈 Quantitative Financial Data Pipeline, Risk Analyzer & Backtester (v2.2)\n",
-    "An automated end-to-end **ETL (Extract, Transform, Load) pipeline**, quantitative risk analyzer, and vectorized backtesting engine built in Python. This system ingests 10 years of historical equity data for **Apple Inc. (`AAPL`)** and **UBS Group AG (`UBSG.SW`)** via Yahoo Finance (`auto_adjust=True`), evaluates strategy backtests across native trading calendars, and updates visualizations daily via **GitHub Actions**.\n",
-    "---\n",
-    "## 🚀 Key Features & Architecture\n",
-    "* **Automated Cloud CI/CD Pipeline:** Scheduled via GitHub Actions (`cron`) at 08:00 UTC, committing updated SQLite databases and visual dashboards automatically.",
-    "* **v2.2 Multi-Factor Regime Filter & Cost Modeling:** Evaluates a trend filter (`Price > SMA50` OR `Price > SMA200 & RSI < 65`) across a 10-year historical ingestion window, incorporating a **10 bps (0.10%)** transaction fee on both Buy & Hold and strategy executions.",
-    "* **Robust Out-of-Sample / In-Sample Separation:** Explicitly documents parameter tuning limitations and regime sensitivity across different asset classes.\n",
-    "---\n",
-    "## 📊 Latest Quantitative Risk & Momentum Summary (1-Year Slice)\n",
-    "```\n" + risk_summary.round(2).to_string() + "\n```\n",
-    "## 🧪 v2.2 Strategy Backtest Comparison (Net of 10 bps Costs)\n",
-    "```\n" + backtest_summary.round(2).to_string() + "\n```\n",
-    "![Backtest Equity Curves](charts/chart_backtest.png)\n",
-    "---\n",
-    "## ⚠️ Methodology, Limitations & Peer-Review Notes\n",
-    "* **In-Sample Optimization & Whipsaw Reduction:** Multi-factor thresholds (`RSI < 65`) were evaluated on historical data to *reduce* (rather than eliminate) whipsaw effects; performance reflects in-sample sample characteristics.",
-    "* **Regime Sensitivity:** Single-rule trend filters perform robustly on trending financial equities (UBS) but encounter friction on tech equities prone to shallow dips (AAPL).",
-    "* **Transaction Costs & Cash Return:** A 10 bps fee is applied to initial Buy & Hold allocation and strategy switches. Cash held outside the market earns **0% risk-free interest**.",
-    "* **Data Ingestion:** Sourced via `yfinance` with `auto_adjust=True` to account for corporate actions and dividends.\n"
-]
+now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+readme = f"""# Financial Data Pipeline, Risk Analyzer & Transparent Backtester (v2.3)
+
+Automated pipeline: **Yahoo Finance -> SQLite -> risk metrics -> backtest -> charts -> this README**,
+for Apple (`AAPL`) and UBS Group (`UBSG.SW`). Refreshed daily by GitHub Actions (see `.github/workflows`).
+Last updated: {now}.
+
+## What it does
+
+* **ETL:** downloads {PERIOD} of daily adjusted prices (`auto_adjust=True`, i.e. splits and dividends included) and stores them in SQLite.
+* **Risk metrics (last {DASH_DAYS} trading days):** annualised volatility, Sharpe ratio, maximum drawdown, SMA(50/200), Wilder's RSI(14).
+* **Backtest:** four rules are compared on identical dates:
+  1. `Buy & Hold`
+  2. `SMA50 Only`: long while price > SMA(50)
+  3. `Multi-Factor`: long while price > SMA(50) OR (price > SMA(200) AND RSI < {RSI_THRESHOLD})
+  4. `Multi-Factor w/o RSI`: ablation, long while price > SMA(50) OR price > SMA(200). Comparing rows 3 and 4 shows whether the RSI condition adds anything.
+* Results are reported for three periods: the **full period**, the **older period** (everything before the last {DASH_DAYS} days) and the **last {DASH_DAYS} days**.
+
+Backtest data: {'; '.join(period_text)}.
+
+## Risk & momentum summary (last {DASH_DAYS} days)
+
+```
+{risk_summary.round(2).to_string()}
+```
+
+## Backtest results (net of {COST * 1e4:.0f} bps per position change)
+
+### Full period
+```
+{seg_table("Full period")}
+```
+![Backtest, full period](charts/chart_backtest.png)
+
+### Older period (before the last {DASH_DAYS} days)
+```
+{seg_table("Older period")}
+```
+
+### {LAST_LABEL} (the window in which the Multi-Factor rule was designed)
+```
+{seg_table(LAST_LABEL)}
+```
+![Backtest, last year](charts/chart_backtest_1y.png)
+
+## Market dashboard
+
+![1-Year Analysis](charts/chart_1year.png)
+![6-Month Analysis](charts/chart_6months.png)
+
+| 1-Month View | 1-Week View |
+| :---: | :---: |
+| ![1-Month Analysis](charts/chart_1month.png) | ![1-Week Analysis](charts/chart_1week.png) |
+
+## How to run locally
+
+```
+git clone https://github.com/seloos/financial-data-analyzer.git
+cd financial-data-analyzer
+pip install -r requirements.txt
+python main.py
+```
+
+## Methodology & limitations
+
+* **No look-ahead:** a signal computed at the close of day t is applied to the returns of day t+1 (`shift(1)`).
+* **Same dates for everyone:** evaluation starts once SMA(200) exists, so all strategies and Buy & Hold cover identical days.
+* **Costs:** {COST * 1e4:.0f} bps per position change, including the initial entry. Each period is run as a fresh start (a strategy that is already invested at the start of a period pays the entry cost, like Buy & Hold).
+* **Cash earns 0%** and the Sharpe ratio uses a 0% risk-free rate. Taxes are ignored.
+* **In-sample warning:** the Multi-Factor rule and its RSI threshold ({RSI_THRESHOLD}) were chosen after looking at the last {DASH_DAYS} days, where SMA(50) alone produced many false signals on AAPL. That window is therefore in-sample. The older period is only a rough out-of-sample check, not a clean one, because the author had already seen the price history.
+* **Two assets, chosen in hindsight:** this is not statistical evidence of any trading edge. Results can look better or worse than Buy & Hold depending on the period, and the tables above are regenerated from live data on every run.
+* **Data:** Yahoo Finance via `yfinance`; no checks for data errors or survivorship effects.
+* **Disclaimer:** educational project, not financial advice.
+"""
 
 with open("README.md", "w") as f:
-    f.write("\n".join(readme_lines))
+    f.write(readme)
 
-print("\nv2.2 Pipeline executed successfully with peer-review enhancements!")
+print("\nv2.3 finished: database, charts, requirements.txt and README.md updated.")
